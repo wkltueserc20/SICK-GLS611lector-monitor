@@ -32,19 +32,90 @@ fn run() -> Result<()> {
     };
     let config = Config::load(&root)?;
     // Acquire both ports before any migration or changes to production data.
-    let ftp_listener = TcpListener::bind((config.ftp_host.as_str(), config.ftp_port))
-        .context("FTP 連接埠已被使用，請先關閉舊監控程式")?;
+    let ftp_listeners = config
+        .ports()
+        .iter()
+        .map(|port| {
+            TcpListener::bind((config.ftp_host.as_str(), *port))
+                .with_context(|| format!("FTP 埠 {port} 已被使用，請先關閉舊監控程式"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let web = tiny_http::Server::http(("127.0.0.1", config.web_port))
         .map_err(|e| anyhow::anyhow!("網頁連接埠已被使用：{e}"))?;
     let store = Arc::new(Mutex::new(Store::open(root, config.clone())?));
     let stop = Arc::new(AtomicBool::new(false));
-    let _ftp = ftp::start(ftp_listener, store.clone(), stop.clone())?;
+    let _ftp = ftp_listeners
+        .into_iter()
+        .map(|listener| ftp::start(listener, store.clone(), stop.clone()))
+        .collect::<Result<Vec<_>>>()?;
     let (s, done) = (store.clone(), stop.clone());
     let _http = thread::spawn(move || {
         while !done.load(Ordering::Relaxed) {
-            if let Ok(Some(request)) = web.recv_timeout(Duration::from_millis(100)) {
-                let route = request.url().split('?').next().unwrap_or("");
-                let reply: Option<(Vec<u8>, &str)> = match route {
+            if let Ok(Some(mut request)) = web.recv_timeout(Duration::from_millis(100)) {
+                let route = request.url().split('?').next().unwrap_or("").to_string();
+                // Configuration writes are only accepted from this local UI, as JSON.
+                // Reject cross-origin requests rather than letting a remote web page alter listeners.
+                if route.starts_with("/api/") && request.method() != &tiny_http::Method::Get {
+                    let result = (|| -> Result<serde_json::Value> {
+                        anyhow::ensure!(
+                            request.method() == &tiny_http::Method::Post && route == "/api/config",
+                            "不支援的操作"
+                        );
+                        let host = request
+                            .headers()
+                            .iter()
+                            .find(|h| h.field.equiv("Host"))
+                            .context("缺少 Host")?
+                            .value
+                            .as_str();
+                        anyhow::ensure!(
+                            host == format!("127.0.0.1:{}", config.web_port),
+                            "不允許的來源"
+                        );
+                        let origin = format!("http://127.0.0.1:{}", config.web_port);
+                        for h in request.headers().iter().filter(|h| h.field.equiv("Origin")) {
+                            anyhow::ensure!(h.value.as_str() == origin, "不允許跨網站修改設定");
+                        }
+                        anyhow::ensure!(
+                            request
+                                .headers()
+                                .iter()
+                                .any(|h| h.field.equiv("Content-Type")
+                                    && h.value.as_str().split(';').next()
+                                        == Some("application/json")),
+                            "請使用 JSON 格式"
+                        );
+                        use std::io::Read;
+                        let mut body = Vec::new();
+                        request.as_reader().take(65537).read_to_end(&mut body)?;
+                        anyhow::ensure!(body.len() <= 65536, "設定檔太大");
+                        let cfg: Config =
+                            serde_json::from_slice(&body).context("設定 JSON 格式錯誤")?;
+                        let state = s.lock().unwrap();
+                        let saved = state.save_config(cfg)?;
+                        Ok(serde_json::json!({"config":saved,"restart_required":true}))
+                    })();
+                    let (status, value) = match result {
+                        Ok(v) => (200, v),
+                        Err(e) => (400, serde_json::json!({"error":format!("{e:#}")})),
+                    };
+                    let _ = request.respond(
+                        tiny_http::Response::from_data(serde_json::to_vec(&value).unwrap())
+                            .with_status_code(status)
+                            .with_header(
+                                tiny_http::Header::from_bytes(
+                                    "Content-Type",
+                                    "application/json; charset=utf-8",
+                                )
+                                .unwrap(),
+                            )
+                            .with_header(
+                                tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap(),
+                            ),
+                    );
+                    continue;
+                }
+                let reply: Option<(Vec<u8>, &str)> = match route.as_str() {
                     "/" => Some((
                         include_bytes!("../assets/index.html").to_vec(),
                         "text/html; charset=utf-8",
@@ -52,12 +123,47 @@ fn run() -> Result<()> {
                     "/logo.png" => {
                         Some((include_bytes!("../assets/logo.png").to_vec(), "image/png"))
                     }
-                    "/favicon.ico" => Some((include_bytes!("../assets/app.ico").to_vec(), "image/x-icon")),
-                    "/app.css" => Some((include_bytes!("../assets/app.css").to_vec(), "text/css; charset=utf-8")),
-                    "/app.js" => Some((include_bytes!("../assets/app.js").to_vec(), "text/javascript; charset=utf-8")),
+                    "/favicon.ico" => {
+                        Some((include_bytes!("../assets/app.ico").to_vec(), "image/x-icon"))
+                    }
+                    "/app.css" => Some((
+                        include_bytes!("../assets/app.css").to_vec(),
+                        "text/css; charset=utf-8",
+                    )),
+                    "/app.js" => Some((
+                        include_bytes!("../assets/app.js").to_vec(),
+                        "text/javascript; charset=utf-8",
+                    )),
+                    "/settings.js" => Some((
+                        include_bytes!("../assets/settings.js").to_vec(),
+                        "text/javascript; charset=utf-8",
+                    )),
                     "/api/status" => {
                         let state = s.lock().unwrap();
-                        Some((serde_json::to_vec(&serde_json::json!({"cameras":state.config.cameras.iter().filter_map(|c|state.cameras.get(&c.ip)).collect::<Vec<_>>(),"engine":"rust-2.0","max_photos":state.config.max_photos,"data_path":state.root.to_string_lossy()})).unwrap(),"application/json; charset=utf-8"))
+                        let cameras = state
+                            .config
+                            .cameras
+                            .iter()
+                            .filter(|c| c.enabled)
+                            .filter_map(|c| {
+                                state.cameras.get(&c.ip).map(|camera| {
+                                    let mut v = serde_json::to_value(camera).unwrap();
+                                    v["ftp_port"] = state.config.port(c).into();
+                                    v
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let pending = Config::load_for_ui(&state.root).ok();
+                        Some((serde_json::to_vec(&serde_json::json!({"cameras":cameras,"engine":"rust-2.2.0","max_photos":state.config.max_photos,"stale_seconds":state.config.stale_seconds,"data_path":state.root.to_string_lossy(),"restart_required":pending.as_ref().is_some_and(|p| serde_json::to_value(p).ok()!=serde_json::to_value(&state.config).ok())})).unwrap(),"application/json; charset=utf-8"))
+                    }
+                    "/api/config" => {
+                        let state = s.lock().unwrap();
+                        let cfg = Config::load_for_ui(&state.root)
+                            .unwrap_or_else(|_| state.config.clone());
+                        Some((
+                            serde_json::to_vec(&cfg).unwrap(),
+                            "application/json; charset=utf-8",
+                        ))
                     }
                     _ => {
                         let state = s.lock().unwrap();
@@ -113,7 +219,11 @@ fn run() -> Result<()> {
     }
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_window_icon(Some(tao::window::Icon::from_rgba(include_bytes!("../assets/app-icon.rgba").to_vec(),64,64)?))
+        .with_window_icon(Some(tao::window::Icon::from_rgba(
+            include_bytes!("../assets/app-icon.rgba").to_vec(),
+            64,
+            64,
+        )?))
         .with_title("擎添工業｜轉接平台影像監控 · Rust")
         .with_inner_size(tao::dpi::LogicalSize::new(1440., 960.))
         .with_min_inner_size(tao::dpi::LogicalSize::new(900., 650.))

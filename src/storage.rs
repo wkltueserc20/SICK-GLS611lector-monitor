@@ -22,8 +22,17 @@ pub fn image(p: &Path) -> bool {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct CameraConfig {
+    #[serde(default)]
+    pub id: String,
     pub ip: String,
     pub label: String,
+    #[serde(default)]
+    pub ftp_port: Option<u16>,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+fn yes() -> bool {
+    true
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -32,6 +41,7 @@ pub struct Config {
     pub ftp_port: u16,
     pub web_port: u16,
     pub max_photos: usize,
+    pub stale_seconds: u64,
     pub cameras: Vec<CameraConfig>,
 }
 impl Default for Config {
@@ -41,41 +51,112 @@ impl Default for Config {
             ftp_port: 2121,
             web_port: 8080,
             max_photos: 1000,
+            stale_seconds: 300,
             cameras: ["左上", "右上", "左下", "右下"]
                 .iter()
                 .enumerate()
                 .map(|(i, s)| CameraConfig {
+                    id: format!("192.168.12.{}", 17 + i),
                     ip: format!("192.168.12.{}", 17 + i),
                     label: (*s).into(),
+                    ftp_port: None,
+                    enabled: true,
                 })
                 .collect(),
         }
     }
 }
 impl Config {
+    pub fn load_for_ui(root: &Path) -> Result<Self> {
+        let mut cfg: Self = serde_json::from_slice(&fs::read(root.join("config.json"))?)?;
+        cfg.normalize_validate()?;
+        Ok(cfg)
+    }
     pub fn load(root: &Path) -> Result<Self> {
         fs::create_dir_all(root)?;
         let file = root.join("config.json");
-        let cfg: Self = if file.exists() {
+        let mut cfg: Self = if file.exists() {
             serde_json::from_slice(&fs::read(&file)?)?
         } else {
             Self::default()
         };
+        cfg.normalize_validate()?;
+        // Persist generated identities so changing an IP cannot lose its history.
+        replace_bytes(&file, &serde_json::to_vec_pretty(&cfg)?)?;
+        Ok(cfg)
+    }
+    pub fn port(&self, c: &CameraConfig) -> u16 {
+        c.ftp_port.unwrap_or(self.ftp_port)
+    }
+    pub fn ports(&self) -> std::collections::BTreeSet<u16> {
+        self.cameras
+            .iter()
+            .filter(|c| c.enabled)
+            .map(|c| self.port(c))
+            .collect()
+    }
+    pub fn normalize_validate(&mut self) -> Result<()> {
         anyhow::ensure!(
-            cfg.max_photos > 0 && cfg.max_photos <= 100000,
+            self.ftp_host.parse::<std::net::Ipv4Addr>().is_ok(),
+            "FTP 綁定位址必須為 IPv4"
+        );
+        anyhow::ensure!(self.ftp_port > 0 && self.web_port > 0, "連接埠不可為 0");
+        anyhow::ensure!(
+            self.stale_seconds <= 604800,
+            "未接收提醒請設定為 0–604800 秒，0 為關閉"
+        );
+        anyhow::ensure!(
+            self.max_photos > 0 && self.max_photos <= 100000,
             "照片上限設定無效"
         );
-        anyhow::ensure!(cfg.cameras.len() == 4, "需要四個相機 IP");
+        anyhow::ensure!(
+            (1..=10).contains(&self.cameras.len()),
+            "設備數量必須為 1–10 台（含停用設備）"
+        );
         let mut ips = std::collections::HashSet::new();
-        for c in &cfg.cameras {
-            c.ip.parse::<std::net::Ipv4Addr>()
-                .context("相機 IP 格式錯誤")?;
-            anyhow::ensure!(ips.insert(&c.ip), "相機 IP 重複");
+        let mut ids = std::collections::HashSet::new();
+        let default_port = self.ftp_port;
+        for c in &mut self.cameras {
+            c.ip =
+                c.ip.trim()
+                    .parse::<std::net::Ipv4Addr>()
+                    .context("相機 IP 格式錯誤")?
+                    .to_string();
+            c.label = c.label.trim().to_string();
+            anyhow::ensure!(
+                !c.label.is_empty() && c.label.chars().count() <= 40,
+                "設備名稱需為 1–40 字"
+            );
+            anyhow::ensure!(ips.insert(c.ip.clone()), "相機 IP 重複");
+            if c.id.is_empty() {
+                c.id = c.ip.clone();
+            }
+            anyhow::ensure!(
+                c.id.len() <= 64
+                    && c.id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+                    && !c.id.starts_with('.')
+                    && !c.id.ends_with('.')
+                    && c.id != "..",
+                "設備識別碼格式錯誤"
+            );
+            let base = c.id.split('.').next().unwrap().to_ascii_uppercase();
+            anyhow::ensure!(
+                !matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                    && !(base.len() == 4
+                        && (base.starts_with("COM") || base.starts_with("LPT"))
+                        && base.ends_with(['1', '2', '3', '4', '5', '6', '7', '8', '9'])),
+                "設備識別碼不可使用 Windows 保留名稱"
+            );
+            anyhow::ensure!(ids.insert(c.id.to_ascii_lowercase()), "設備識別碼重複");
+            let port = c.ftp_port.unwrap_or(default_port);
+            anyhow::ensure!(
+                port > 0 && port != self.web_port && !(30000..=30010).contains(&port),
+                "FTP 埠不可為 0、網頁埠或 30000–30010"
+            );
         }
-        if !file.exists() {
-            fs::write(file, serde_json::to_vec_pretty(&cfg)?)?;
-        }
-        Ok(cfg)
+        Ok(())
     }
 }
 
@@ -94,6 +175,8 @@ fn unknown() -> String {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Camera {
+    #[serde(default)]
+    pub id: String,
     pub ip: String,
     pub label: String,
     pub latest: Option<Snapshot>,
@@ -226,15 +309,22 @@ impl Store {
             .cameras
             .iter()
             .map(|c| {
-                let mut cam = saved.get(&c.ip).cloned().unwrap_or(Camera {
-                    ip: c.ip.clone(),
-                    label: c.label.clone(),
-                    latest: None,
-                    ng: None,
-                    count: 0,
-                    retained: 0,
-                });
+                let mut cam = saved
+                    .values()
+                    .find(|s| s.id == c.id || (s.id.is_empty() && s.ip == c.id))
+                    .cloned()
+                    .unwrap_or(Camera {
+                        id: c.id.clone(),
+                        ip: c.ip.clone(),
+                        label: c.label.clone(),
+                        latest: None,
+                        ng: None,
+                        count: 0,
+                        retained: 0,
+                    });
                 cam.label = c.label.clone();
+                cam.id = c.id.clone();
+                cam.ip = c.ip.clone();
                 (c.ip.clone(), cam)
             })
             .collect();
@@ -245,7 +335,7 @@ impl Store {
         };
         let ips: Vec<_> = s.cameras.keys().cloned().collect();
         for ip in ips {
-            fs::create_dir_all(s.root.join("photos").join(&ip))?;
+            fs::create_dir_all(s.root.join("photos").join(s.folder(&ip)?))?;
             let mut files = s.files(&ip)?;
             files.sort_by(|a, b| mtime(a).total_cmp(&mtime(b)));
             for p in files {
@@ -258,9 +348,39 @@ impl Store {
     }
     pub fn files(&self, ip: &str) -> Result<Vec<PathBuf>> {
         let mut v = vec![];
-        walk(&self.root.join("photos").join(ip), &mut v)?;
-        walk(&self.root.join("ng_photos").join(ip), &mut v)?;
+        let folder = self.folder(ip)?;
+        walk(&self.root.join("photos").join(folder), &mut v)?;
+        walk(&self.root.join("ng_photos").join(folder), &mut v)?;
         Ok(v)
+    }
+    pub fn folder(&self, ip: &str) -> Result<&str> {
+        Ok(&self.cameras.get(ip).context("Unknown IP")?.id)
+    }
+    pub fn accepts(&self, ip: &str, port: u16) -> bool {
+        self.config
+            .cameras
+            .iter()
+            .any(|c| c.enabled && c.ip == ip && self.config.port(c) == port)
+    }
+    pub fn save_config(&self, mut cfg: Config) -> Result<Config> {
+        cfg.normalize_validate()?;
+        // A port already used outside this process must be fixed before saving.
+        for port in cfg.ports() {
+            if cfg.ftp_host != self.config.ftp_host || !self.config.ports().contains(&port) {
+                std::net::TcpListener::bind((cfg.ftp_host.as_str(), port))
+                    .with_context(|| format!("FTP 埠 {port} 已被使用或無法綁定"))?;
+            }
+        }
+        if cfg.web_port != self.config.web_port {
+            std::net::TcpListener::bind(("127.0.0.1", cfg.web_port)).context("網頁埠已被使用")?;
+        }
+        let bytes = serde_json::to_vec_pretty(&cfg)?;
+        let file = self.root.join("config.json");
+        if file.exists() {
+            replace_bytes(&self.root.join("config.previous.json"), &fs::read(&file)?)?;
+        }
+        replace_bytes(&file, &bytes)?;
+        Ok(cfg)
     }
     pub fn save(&self) -> Result<()> {
         replace_bytes(
@@ -285,7 +405,7 @@ impl Store {
     pub fn record(&mut self, ip: &str, path: &Path) -> Result<()> {
         if image(path) {
             let ext = path.extension().unwrap().to_string_lossy();
-            let name = format!("latest-{}.{}", ip.rsplit('.').next().unwrap(), ext);
+            let name = format!("latest-{}.{}", self.folder(ip)?, ext);
             replace_bytes(&self.root.join("data").join(&name), &fs::read(path)?)?;
             let cam = self.cameras.get_mut(ip).context("Unknown IP")?;
             cam.count += 1;
@@ -336,7 +456,7 @@ impl Store {
         if cam.ng.as_ref().is_none_or(|n| received > n.time) {
             let filename = format!(
                 "ng-{}.{}",
-                ip.rsplit('.').next().unwrap(),
+                cam.id,
                 path.extension().unwrap().to_string_lossy()
             );
             replace_bytes(&self.root.join("data").join(&filename), &fs::read(path)?)?;
@@ -348,9 +468,9 @@ impl Store {
                 codes: vec![],
             });
         }
-        let ngroot = self.root.join("ng_photos").join(ip);
+        let ngroot = self.root.join("ng_photos").join(&cam.id);
         if !path.starts_with(&ngroot) {
-            let relative = path.strip_prefix(self.root.join("photos").join(ip))?;
+            let relative = path.strip_prefix(self.root.join("photos").join(&cam.id))?;
             let mut dest = ngroot.join(relative);
             fs::create_dir_all(dest.parent().unwrap())?;
             if dest.exists() || dest.with_extension("xml").exists() {
@@ -403,6 +523,60 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn variable_devices_and_validation() {
+        let mut cfg = Config::default();
+        cfg.cameras.truncate(1);
+        cfg.normalize_validate().unwrap();
+        let first = cfg.cameras[0].clone();
+        for n in 2..=10 {
+            let mut c = first.clone();
+            c.id = format!("device-{n}");
+            c.ip = format!("10.1.0.{n}");
+            c.ftp_port = Some(2100 + n);
+            cfg.cameras.push(c);
+        }
+        cfg.normalize_validate().unwrap();
+        cfg.cameras.push(first.clone());
+        assert!(cfg.normalize_validate().is_err());
+        cfg.cameras.pop();
+        cfg.cameras[1].ftp_port = Some(30000);
+        assert!(cfg.normalize_validate().is_err());
+        cfg.cameras[1].ftp_port = Some(8080);
+        assert!(cfg.normalize_validate().is_err());
+        cfg.cameras[1].ftp_port = Some(2121);
+        cfg.cameras[1].ip = first.ip;
+        assert!(cfg.normalize_validate().is_err());
+    }
+    #[test]
+    fn stable_history_after_ip_change() {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let mut cfg = Config::default();
+        cfg.cameras.truncate(1);
+        let old = cfg.cameras[0].ip.clone();
+        let mut s = Store::open(root.clone(), cfg.clone()).unwrap();
+        let p = root.join("photos").join(&old).join("first.jpg");
+        fs::write(&p, b"history").unwrap();
+        fs::write(
+            p.with_extension("xml"),
+            "<camera><image><symbol><result>NoRead</result></symbol></image></camera>",
+        )
+        .unwrap();
+        s.record(&old, &p).unwrap();
+        let previous = s.cameras[&old].ng.clone().unwrap();
+        drop(s);
+        cfg.cameras[0].ip = "10.2.0.17".into();
+        let s = Store::open(root.clone(), cfg).unwrap();
+        assert_eq!(
+            s.cameras["10.2.0.17"].ng.as_ref().unwrap().file,
+            previous.file
+        );
+        assert_eq!(s.files("10.2.0.17").unwrap().len(), 1);
+        assert!(s.accepts("10.2.0.17", 2121));
+        assert!(!s.accepts(&old, 2121));
+        drop(s);
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn no_read_not_profiler() {
         let x="<camera><image><EVTimingAnalysis Name='DecoRun'/><DecoderProfiler><procd-img-trig><FramesDecoded>1</FramesDecoded></procd-img-trig></DecoderProfiler></image></camera>";

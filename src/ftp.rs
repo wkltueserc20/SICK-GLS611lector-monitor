@@ -92,17 +92,14 @@ pub fn start(
     stop: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>> {
     listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
     let pairs: Pairs = Arc::new(Mutex::new(HashMap::new()));
     let clients = Arc::new(AtomicUsize::new(0));
     Ok(thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, peer)) => {
-                    if !store
-                        .lock()
-                        .unwrap()
-                        .cameras
-                        .contains_key(&peer.ip().to_string())
+                    if !store.lock().unwrap().accepts(&peer.ip().to_string(), port)
                         || clients.load(Ordering::Relaxed) >= 16
                     {
                         drop(stream);
@@ -138,7 +135,10 @@ fn session(mut control: TcpStream, store: Shared, pairs: Pairs) -> Result<()> {
     let mut username = String::new();
     let mut authenticated = false;
     let mut data: Option<Data> = None;
-    let root = store.lock().unwrap().root.join("photos").join(&ip);
+    let root = {
+        let s = store.lock().unwrap();
+        s.root.join("photos").join(s.folder(&ip)?)
+    };
     fs::create_dir_all(&root)?;
     reply(&mut control, "220 ChingTech camera receiver ready")?;
     store

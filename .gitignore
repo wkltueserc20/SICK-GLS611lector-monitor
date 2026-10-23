@@ -4,6 +4,7 @@
 /data/
 /logs/
 /config.json
+/config.previous.json
 __pycache__/
 *.pyc
 *.exe
