@@ -1,0 +1,14 @@
+/target/
+/photos/
+/ng_photos/
+/data/
+/logs/
+/config.json
+__pycache__/
+*.pyc
+*.exe
+*.zip
+.env
+.env.*
+*.pem
+*.key

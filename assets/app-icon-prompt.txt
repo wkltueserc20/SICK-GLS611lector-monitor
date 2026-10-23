@@ -1,0 +1,4 @@
+製作方式：內建 imagegen；透明背景。
+
+Final prompt:
+Use case: logo-brand. Asset type: Windows desktop application icon for an industrial four-camera barcode monitoring application. Create ONE polished, simple icon, centered square composition, generous silhouette occupying 85% of canvas. A dark navy rounded-square tile with a bold cyan-blue camera lens / scanner motif and a small clearly readable four-pane 2x2 monitor motif integrated into the camera body. Use crisp thick geometry and a restrained subtle dimensional finish, strong contrast, readable at 16, 32 and 48 pixels. Navy, sky blue and white palette matching an industrial dashboard. No letters, no words, no watermark, no tiny decorative circuitry, no background scene. Actual transparent background outside the rounded-square tile. This is a finished icon asset, not a mockup or a grid of variants.
