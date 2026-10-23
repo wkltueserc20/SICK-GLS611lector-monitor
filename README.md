@@ -1,5 +1,7 @@
 # SICK 轉接平台讀碼影像監控
 
+**[開啟互動展示版](https://wkltueserc20.github.io/SICK-GLS611lector-monitor/)** · 不需安裝或連接設備，可體驗一台／四台／十台、OK／NG 模擬、照片放大與設備設定。所有圖片及條碼均為假資料，設定僅影響訪客自己的瀏覽器。[展示版說明](demo/README.md)
+
 集中監看 1～10 台讀碼器（預設四台）的最新照片、最近 NG 照片與條碼文字。以 Rust 接收 FTP 圖片與 XML，使用網頁介面嵌入 Windows 視窗。部署不需要 Python 或 Node.js。
 
 **下載：[Releases 免安裝部署包](https://github.com/wkltueserc20/SICK-GLS611lector-monitor/releases/latest)**。請下載版本 ZIP，解壓後執行 EXE。這是免安裝部署包，不會自動修改相機或防火牆。

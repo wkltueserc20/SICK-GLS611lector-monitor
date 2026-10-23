@@ -1,0 +1,37 @@
+name: Deploy interactive demo
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'demo/**'
+      - '.github/workflows/demo-pages.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages-demo
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check static scripts
+        run: |
+          node --check demo/app.js
+          node --check demo/settings.js
+          node --check demo/simulator.js
+          node --check demo/controls.js
+          node tests/demo_test.cjs
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
